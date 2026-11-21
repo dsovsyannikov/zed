@@ -1921,6 +1921,14 @@ impl Sidebar {
                 }
 
                 threads.sort_by(|a, b| {
+                    // Supervisor order within a project group: threads blocked on
+                    // you first, then live runs, then errored, then the
+                    // chronological rest (untouched threads keep pure recency).
+                    let a_rank = Self::thread_status_rank(a.status);
+                    let b_rank = Self::thread_status_rank(b.status);
+                    if a_rank != b_rank {
+                        return a_rank.cmp(&b_rank);
+                    }
                     let a_time = Self::thread_display_time(&a.metadata);
                     let b_time = Self::thread_display_time(&b.metadata);
                     b_time.cmp(&a_time)
@@ -5947,6 +5955,18 @@ impl Sidebar {
 
     fn thread_display_time(metadata: &ThreadMetadata) -> DateTime<Utc> {
         metadata.interacted_at.unwrap_or(metadata.updated_at)
+    }
+
+    /// Sort rank lifting live work above the chronological tail: waiting on you
+    /// (the only state that demands attention) outranks running outranks errored.
+    fn thread_status_rank(status: AgentThreadStatus) -> u8 {
+        match status {
+            AgentThreadStatus::WaitingForConfirmation => 0,
+            AgentThreadStatus::Running => 1,
+            AgentThreadStatus::Error => 2,
+            AgentThreadStatus::Unconfirmed => 3,
+            AgentThreadStatus::Completed => 4,
+        }
     }
 
     fn push_entries_by_display_time(
