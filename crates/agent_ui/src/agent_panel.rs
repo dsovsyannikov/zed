@@ -10103,16 +10103,14 @@ mod tests {
                 .active_agent_thread(cx)
                 .expect("active agent thread");
             let tool_call_id = acp::ToolCallId::new("test-tool-call");
+            let label = format!("Tool {tool_call_id}");
             let option_id = acp_v2::PermissionOptionId::new("allow-once");
             let _authorization_task = thread.update(cx, |thread, cx| {
                 thread
                     .request_tool_call_authorization(
-                        acp::ToolCall::new(
-                            acp::ToolCallId::new(tool_call_id.0),
-                            "Tool call".into(),
-                        )
-                        .kind(acp::ToolKind::Edit)
-                        .into(),
+                        acp::ToolCall::new(acp::ToolCallId::new(tool_call_id.0), label)
+                            .kind(acp::ToolKind::Edit)
+                            .into(),
                         acp_thread::PermissionOptions::Flat(vec![acp_v2::PermissionOption::new(
                             option_id,
                             "Allow",

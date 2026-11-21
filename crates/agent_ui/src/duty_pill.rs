@@ -1,14 +1,25 @@
-use crate::AgentPanel;
+use crate::{AgentPanel, AgentPanelEvent};
+use agent_client_protocol::v2::schema as acp_v2;
 use agent_settings::AgentSettings;
+use chrono::{DateTime, Utc};
 use gpui::{
-    App, Context, Entity, EntityId, IntoElement, ParentElement, Render, Styled, Subscription,
-    WeakEntity, Window,
+    App, Context, Entity, EntityId, IntoElement, ParentElement, Render, SharedString, Styled,
+    Subscription, WeakEntity, Window,
 };
 use project::DisableAiSettings;
 use settings::Settings;
 use std::collections::HashSet;
 use ui::{Tooltip, prelude::*};
-use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
+use workspace::{HideStatusItem, PathList, StatusItemView, Workspace, item::ItemHandle};
+
+/// The oldest waiting thread across the workspace group: `(created_at,
+/// session id, work dirs, title)`.
+type OldestWaitingThread = (
+    DateTime<Utc>,
+    acp_v2::SessionId,
+    Option<PathList>,
+    Option<SharedString>,
+);
 
 /// Right-side status bar item aggregating live agent thread states across the
 /// workspace's sidebar threads. Renders `N waiting · N running · N error`
@@ -39,7 +50,10 @@ impl DutyPill {
             // threads sidebar.
             _workspace_subscription: cx.subscribe(
                 workspace,
-                |this, _, event: &workspace::Event, cx| {
+                |this: &mut DutyPill,
+                 _: Entity<Workspace>,
+                 event: &workspace::Event,
+                 cx: &mut Context<Self>| {
                     if matches!(event, workspace::Event::PanelAdded(_)) {
                         this.sync_panel_subscriptions(cx);
                         cx.notify();
@@ -65,8 +79,15 @@ impl DutyPill {
             }
             self._panel_subscriptions
                 .push(cx.observe(&panel, |_, _, cx| cx.notify()));
-            self._panel_subscriptions
-                .push(cx.subscribe(&panel, |_, _, _, cx| cx.notify()));
+            self._panel_subscriptions.push(cx.subscribe(
+                &panel,
+                |_: &mut DutyPill,
+                 _: Entity<AgentPanel>,
+                 _: &AgentPanelEvent,
+                 cx: &mut Context<Self>| {
+                    cx.notify();
+                },
+            ));
         }
     }
 
@@ -92,7 +113,7 @@ impl DutyPill {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let mut oldest_waiting: Option<_> = None;
+        let mut oldest_waiting: Option<OldestWaitingThread> = None;
         for workspace in &self.group_workspaces(cx) {
             let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
                 continue;
