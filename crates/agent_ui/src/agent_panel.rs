@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
+use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::v2::schema as acp_v2;
 use agent_servers::AgentServer;
@@ -4237,6 +4237,73 @@ impl AgentPanel {
             .collect()
     }
 
+    /// Live duty counts across this panel's conversation views: (waiting,
+    /// running, error). Mirrors the live status derivation the threads
+    /// sidebar uses.
+    pub fn thread_status_counts(&self, cx: &App) -> (usize, usize, usize) {
+        let mut counts = (0, 0, 0);
+        for conversation_view in self.conversation_views() {
+            let conversation_view = conversation_view.read(cx);
+            let Some(thread_view) = conversation_view.root_thread_view() else {
+                continue;
+            };
+            let thread = thread_view.read(cx).thread.read(cx);
+            if conversation_view.root_thread_is_waiting_for_input(cx) {
+                counts.0 += 1;
+            } else if thread.had_error() {
+                counts.2 += 1;
+            } else {
+                match thread.status() {
+                    ThreadStatus::Generating => counts.1 += 1,
+                    ThreadStatus::Unconfirmed | ThreadStatus::Idle => {}
+                }
+            }
+        }
+        counts
+    }
+
+    /// The oldest live thread in this panel that is waiting for confirmation,
+    /// as `(created_at, session id, work dirs, title)`. Panel-local: compare
+    /// across panels to find the oldest in the workspace group.
+    pub fn oldest_waiting_thread(
+        &self,
+        cx: &App,
+    ) -> Option<(
+        chrono::DateTime<chrono::Utc>,
+        acp_v2::SessionId,
+        Option<PathList>,
+        Option<SharedString>,
+    )> {
+        let thread_store = ThreadMetadataStore::global(cx);
+        let mut oldest: Option<(chrono::DateTime<chrono::Utc>, _, _, _)> = None;
+        for conversation_view in self.conversation_views() {
+            let conversation_view = conversation_view.read(cx);
+            if !conversation_view.root_thread_is_waiting_for_input(cx) {
+                continue;
+            }
+            let Some(thread_view) = conversation_view.root_thread_view() else {
+                continue;
+            };
+            let session_id = thread_view.read(cx).thread.read(cx).session_id().clone();
+            let Some(metadata) = thread_store.read(cx).entry_by_session(&session_id) else {
+                continue;
+            };
+            let candidate = (
+                metadata.created_at.unwrap_or(metadata.updated_at),
+                session_id,
+                Some(metadata.folder_paths().clone()),
+                metadata.title(),
+            );
+            if oldest
+                .as_ref()
+                .is_none_or(|(current, ..)| candidate.0 < *current)
+            {
+                oldest = Some(candidate);
+            }
+        }
+        oldest
+    }
+
     pub fn active_thread_view(&self, cx: &App) -> Option<Entity<ThreadView>> {
         let server_view = self.active_conversation_view()?;
         server_view.read(cx).root_thread_view()
@@ -4356,6 +4423,21 @@ impl AgentPanel {
     ) {
         let subscription = if let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) {
             let subscription = cx.subscribe(&acp_thread, |this, acp_thread, event, cx| {
+                // Status changes and new tool authorization / elicitation
+                // requests change the live status surfaced by the threads
+                // sidebar and the duty pill even while the thread is busy,
+                // and ConversationView may swallow the underlying event, so
+                // the panel has to notify directly.
+                if matches!(
+                    event,
+                    AcpThreadEvent::StatusChanged
+                        | AcpThreadEvent::ToolAuthorizationRequested(_)
+                        | AcpThreadEvent::ToolAuthorizationReceived(_)
+                        | AcpThreadEvent::ElicitationRequested(_)
+                        | AcpThreadEvent::ElicitationResponded(_)
+                ) {
+                    cx.notify();
+                }
                 if matches!(
                     event,
                     AcpThreadEvent::StatusChanged
@@ -9980,6 +10062,75 @@ mod tests {
         });
 
         (panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_thread_status_counts_across_waiting_running_and_completed_threads(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.thread_status_counts(cx), (0, 0, 0));
+            assert!(panel.oldest_waiting_thread(cx).is_none());
+        });
+
+        // Completed thread: the stub responds immediately, so the thread
+        // settles back to idle.
+        let completed_connection = StubAgentConnection::new();
+        completed_connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Done".into()),
+        )]);
+        open_thread_with_connection(&panel, completed_connection, &mut cx);
+        send_message(&panel, &mut cx);
+        cx.run_until_parked();
+
+        // Running thread: the stub never responds, so the thread keeps
+        // generating.
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        send_message(&panel, &mut cx);
+        cx.run_until_parked();
+
+        // Waiting thread: the newest (active) thread gets a pending tool
+        // authorization request, so it lands in WaitingForConfirmation while
+        // the previously opened thread keeps generating.
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        send_message(&panel, &mut cx);
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let thread = panel
+                .read(cx)
+                .active_agent_thread(cx)
+                .expect("active agent thread");
+            let tool_call_id = acp::ToolCallId::new("test-tool-call");
+            let option_id = acp_v2::PermissionOptionId::new("allow-once");
+            let _authorization_task = thread.update(cx, |thread, cx| {
+                thread
+                    .request_tool_call_authorization(
+                        acp::ToolCall::new(
+                            acp::ToolCallId::new(tool_call_id.0),
+                            "Tool call".into(),
+                        )
+                        .kind(acp::ToolKind::Edit)
+                        .into(),
+                        acp_thread::PermissionOptions::Flat(vec![acp_v2::PermissionOption::new(
+                            option_id,
+                            "Allow",
+                            acp_v2::PermissionOptionKind::AllowOnce,
+                        )]),
+                        acp_thread::AuthorizationKind::PermissionGrant,
+                        cx,
+                    )
+                    .unwrap()
+            });
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            // The completed thread is idle, so only the waiting and running
+            // threads are counted.
+            assert_eq!(panel.thread_status_counts(cx), (1, 1, 0));
+        });
     }
 
     fn expected_terminal_drop_text(paths: &[PathBuf]) -> String {

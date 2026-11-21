@@ -11,6 +11,8 @@ mod context_server_configuration;
 pub(crate) mod conversation_view;
 mod diagnostics;
 pub mod draft_prompt_store;
+mod duty_pill;
+pub use duty_pill::DutyPill;
 mod entry_view_state;
 mod external_source_prompt;
 mod inline_assistant;
