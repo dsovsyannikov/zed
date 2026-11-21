@@ -6512,6 +6512,87 @@ async fn test_confirm_on_historical_thread_preserves_historical_timestamp_and_or
 }
 
 #[gpui::test]
+async fn test_waiting_thread_outranks_newer_completed_thread(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    // An older live thread that ends up waiting for confirmation.
+    open_thread_with_connection(&panel, StubAgentConnection::new(), cx);
+    send_message(&panel, cx);
+    let waiting_session_id = active_session_id(&panel, cx);
+    save_test_thread_metadata(&waiting_session_id, &project, cx).await;
+    let waiting_thread = cx.update(|_, cx| panel.read(cx).active_agent_thread(cx).unwrap());
+    request_test_tool_authorization(&waiting_thread, "waiting-tool-call", "allow-waiting", cx);
+    cx.run_until_parked();
+
+    // A strictly newer thread that already completed: without the supervisor
+    // rank in the final sort, pure recency would list it above the waiting one.
+    let completed_session_id = acp::SessionId::new(Arc::from("newer-completed-thread"));
+    let completed_timestamp = Utc::now() + chrono::Duration::hours(1);
+    save_thread_metadata(
+        completed_session_id.clone(),
+        Some("Newer Completed Thread".into()),
+        completed_timestamp,
+        Some(completed_timestamp),
+        None,
+        &project,
+        cx,
+    );
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    let waiting_status = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Thread(thread)
+                    if thread.metadata.session_id.as_ref() == Some(&waiting_session_id) =>
+                {
+                    Some(thread.status)
+                }
+                _ => None,
+            })
+            .expect("Expected the waiting thread entry in the sidebar")
+    });
+    assert_eq!(
+        waiting_status,
+        AgentThreadStatus::WaitingForConfirmation,
+        "expected the older live thread to be waiting for confirmation"
+    );
+
+    let waiting_position = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(thread)
+                    if thread.metadata.session_id.as_ref() == Some(&waiting_session_id))
+            })
+            .expect("expected the waiting thread to appear in the sidebar")
+    });
+    let completed_position = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(thread)
+                    if thread.metadata.session_id.as_ref() == Some(&completed_session_id))
+            })
+            .expect("expected the completed thread to appear in the sidebar")
+    });
+    assert!(
+        waiting_position < completed_position,
+        "expected the waiting thread to render above the newer completed thread despite being older"
+    );
+}
+
+#[gpui::test]
 async fn test_confirm_on_historical_thread_in_new_project_group_opens_real_thread(
     cx: &mut TestAppContext,
 ) {

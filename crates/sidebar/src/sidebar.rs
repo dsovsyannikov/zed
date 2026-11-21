@@ -1921,14 +1921,6 @@ impl Sidebar {
                 }
 
                 threads.sort_by(|a, b| {
-                    // Supervisor order within a project group: threads blocked on
-                    // you first, then live runs, then errored, then the
-                    // chronological rest (untouched threads keep pure recency).
-                    let a_rank = Self::thread_status_rank(a.status);
-                    let b_rank = Self::thread_status_rank(b.status);
-                    if a_rank != b_rank {
-                        return a_rank.cmp(&b_rank);
-                    }
                     let a_time = Self::thread_display_time(&a.metadata);
                     let b_time = Self::thread_display_time(&b.metadata);
                     b_time.cmp(&a_time)
@@ -5959,6 +5951,10 @@ impl Sidebar {
 
     /// Sort rank lifting live work above the chronological tail: waiting on you
     /// (the only state that demands attention) outranks running outranks errored.
+    ///
+    /// Unconfirmed sits below the confirmed-alive states: upstream it marks a
+    /// restored session whose activity is not yet confirmed (it may still be
+    /// running), and elevating it would let stale sessions resurrect to the top.
     fn thread_status_rank(status: AgentThreadStatus) -> u8 {
         match status {
             AgentThreadStatus::WaitingForConfirmation => 0,
@@ -5987,11 +5983,26 @@ impl Sidebar {
             }
         }
 
+        // Supervisor rank leads; recency only orders rows within the same rank.
+        fn supervisor_rank(entry: &ListEntry) -> u8 {
+            match entry {
+                ListEntry::Thread(thread) => Sidebar::thread_status_rank(thread.status),
+                // Terminals have no live status: rank them with the completed
+                // tail so they stay purely chronological among themselves.
+                ListEntry::Terminal(_) => {
+                    Sidebar::thread_status_rank(AgentThreadStatus::Completed)
+                }
+                ListEntry::ProjectHeader { .. } => unreachable!(),
+            }
+        }
+
         let row_entries = terminals
             .into_iter()
             .map(ListEntry::Terminal)
             .chain(threads.into_iter().map(ListEntry::Thread))
-            .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
+            .sorted_by_key(|right| {
+                (supervisor_rank(right), std::cmp::Reverse(display_time(right)))
+            });
 
         for entry in row_entries {
             if let ListEntry::Thread(thread) = &entry {
