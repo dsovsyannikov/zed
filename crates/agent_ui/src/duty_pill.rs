@@ -38,7 +38,7 @@ pub struct DutyPill {
 
 impl DutyPill {
     pub fn new(workspace: &Entity<Workspace>, cx: &mut Context<Self>) -> Self {
-        let mut this = Self {
+        Self {
             workspace: workspace.downgrade(),
             observed_panels: HashSet::new(),
             _workspace_observation: cx.observe(workspace, |this, _, cx| {
@@ -47,48 +47,56 @@ impl DutyPill {
             }),
             // Panels are registered asynchronously after the status bar is
             // built, so watch for panel additions explicitly, mirroring the
-            // threads sidebar.
+            // threads sidebar. The panel is taken from the event payload:
+            // reading the workspace here could double-lease it, because this
+            // fires while the workspace update that added the panel is still
+            // on the stack.
             _workspace_subscription: cx.subscribe(
                 workspace,
                 |this: &mut DutyPill,
                  _: Entity<Workspace>,
                  event: &workspace::Event,
                  cx: &mut Context<Self>| {
-                    if matches!(event, workspace::Event::PanelAdded(_)) {
-                        this.sync_panel_subscriptions(cx);
+                    if let workspace::Event::PanelAdded(view) = event
+                        && let Ok(panel) = view.clone().downcast::<AgentPanel>()
+                    {
+                        this.subscribe_to_panel(&panel, cx);
                         cx.notify();
                     }
                 },
             ),
             _panel_subscriptions: Vec::new(),
-        };
-        this.sync_panel_subscriptions(cx);
-        this
+        }
     }
 
     /// Panels register asynchronously, so (re)attach to every panel across
     /// the workspace group that isn't subscribed yet, mirroring the threads
-    /// sidebar's panel subscription handling.
+    /// sidebar's panel subscription handling. Only call this from post-update
+    /// contexts (observers, render): reading the workspace while it is being
+    /// updated would double-lease it.
     fn sync_panel_subscriptions(&mut self, cx: &mut Context<Self>) {
         for workspace in self.group_workspaces(cx) {
-            let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
-                continue;
-            };
-            if !self.observed_panels.insert(panel.entity_id()) {
-                continue;
+            if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                self.subscribe_to_panel(&panel, cx);
             }
-            self._panel_subscriptions
-                .push(cx.observe(&panel, |_, _, cx| cx.notify()));
-            self._panel_subscriptions.push(cx.subscribe(
-                &panel,
-                |_: &mut DutyPill,
-                 _: Entity<AgentPanel>,
-                 _: &AgentPanelEvent,
-                 cx: &mut Context<Self>| {
-                    cx.notify();
-                },
-            ));
         }
+    }
+
+    fn subscribe_to_panel(&mut self, panel: &Entity<AgentPanel>, cx: &mut Context<Self>) {
+        if !self.observed_panels.insert(panel.entity_id()) {
+            return;
+        }
+        self._panel_subscriptions
+            .push(cx.observe(&panel, |_, _, cx| cx.notify()));
+        self._panel_subscriptions.push(cx.subscribe(
+            &panel,
+            |_: &mut DutyPill,
+             _: Entity<AgentPanel>,
+             _: &AgentPanelEvent,
+             cx: &mut Context<Self>| {
+                cx.notify();
+            },
+        ));
     }
 
     /// All workspaces in this workspace's project group, matching the threads
